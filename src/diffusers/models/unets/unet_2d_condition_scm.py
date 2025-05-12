@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint
+from einops import rearrange
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import PeftAdapterMixin, UNet2DConditionLoadersMixin
@@ -45,7 +46,7 @@ from ..embeddings import (
     Timesteps,
 )
 from ..modeling_utils import ModelMixin
-from .unet_2d_blocks import (
+from .unet_2d_blocks_scm import (
     get_down_block,
     get_mid_block,
     get_up_block,
@@ -922,8 +923,9 @@ class UNet2DConditionModel(
             timesteps = timesteps[None].to(sample.device)
 
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-        timesteps = timesteps.expand(sample.shape[0])
-
+        # timesteps = timesteps.expand(sample.shape[0])
+        # print("sample.shape", sample.shape)
+        # print("timesteps.shape", timesteps.shape)
         t_emb = self.time_proj(timesteps)
         # `Timesteps` does not contain any weights and will always return f32 tensors
         # but time_embedding might actually be running in fp16. so we need to cast here.
@@ -970,11 +972,13 @@ class UNet2DConditionModel(
                     f"{self.__class__} has the config param `addition_embed_type` set to 'text_time' which requires the keyword argument `text_embeds` to be passed in `added_cond_kwargs`"
                 )
             text_embeds = added_cond_kwargs.get("text_embeds")
+            # print("text_embeds.shape", text_embeds.shape)
             if "time_ids" not in added_cond_kwargs:
                 raise ValueError(
                     f"{self.__class__} has the config param `addition_embed_type` set to 'text_time' which requires the keyword argument `time_ids` to be passed in `added_cond_kwargs`"
                 )
             time_ids = added_cond_kwargs.get("time_ids")
+            # print("time_ids.shape", time_ids.shape)
             time_embeds = self.add_time_proj(time_ids.flatten())
             time_embeds = time_embeds.reshape((text_embeds.shape[0], -1))
             add_embeds = torch.concat([text_embeds, time_embeds], dim=-1)
@@ -1137,27 +1141,43 @@ class UNet2DConditionModel(
             sample = 2 * sample - 1.0
 
         # 1. time
-        t_emb = self.get_time_embed(sample=sample, timestep=timestep)
+        # TODO 输入为1D tensor，输出为B, C
+        b, _, h, w = timestep.shape
+        # print("timestep", timestep.shape) # [1, 1, 128, 128]
+        timestep = rearrange(timestep, "b 1 h w -> (b h w)")
+        t_emb = self.get_time_embed(sample=sample, timestep=timestep) # [b*h*w, emb_dim]
         # print("get_time_embed", t_emb[0])
-        emb = self.time_embedding(t_emb, timestep_cond)
-
-        class_emb = self.get_class_embed(sample=sample, class_labels=class_labels)
+        # TODO 内部都是Linear，输入为B, C，输出为B, time_embed_dim
+        if timestep_cond is not None:
+            if timestep_cond.ndim != 4:
+                timestep_cond = timestep_cond[..., None, None].expand(-1, -1, h, w)
+            timestep_cond = rearrange(timestep_cond, "b c h w -> (b h w) c")
+            # print(timestep_cond.shape)
+        # print(t_emb)
+        # print(timestep_cond)
+        emb = self.time_embedding(t_emb, timestep_cond) # [b*h*w, emb_dim]
+        # TODO reshape
+        emb = rearrange(emb, "(b h w) d -> b d h w", b=b, h=h, w=w) # [b, emb_dim, h, w] [1, 1280, 128, 128]
+        # 
+        class_emb = self.get_class_embed(sample=sample, class_labels=class_labels) # None
         if class_emb is not None:
             if self.config.class_embeddings_concat:
                 emb = torch.cat([emb, class_emb], dim=-1)
             else:
                 emb = emb + class_emb
-
+        # encoder_hidden_states 
+        # print(added_cond_kwargs.keys())
         aug_emb = self.get_aug_embed(
             emb=emb, encoder_hidden_states=encoder_hidden_states, added_cond_kwargs=added_cond_kwargs
-        )
+        ) # [2, 1280]
+        # print("encoder_hidden_states", encoder_hidden_states.shape)
+        # print("aug_emb", aug_emb.shape)
         if self.config.addition_embed_type == "image_hint":
             aug_emb, hint = aug_emb
             sample = torch.cat([sample, hint], dim=1)
 
-        emb = emb + aug_emb if aug_emb is not None else emb
-        # print("emb[0]", emb[0])
-
+        emb = emb + aug_emb[..., None, None] if aug_emb is not None else emb
+        # print("emb[0]", emb[0, :, 0, 0])
         if self.time_embed_act is not None:
             emb = self.time_embed_act(emb)
 
@@ -1213,7 +1233,7 @@ class UNet2DConditionModel(
                 if is_adapter and len(down_intrablock_additional_residuals) > 0:
                     additional_residuals["additional_residuals"] = down_intrablock_additional_residuals.pop(0)
 
-                # print("emb[0]", emb[0, :])
+                # print("emb[0]", emb[0, :, 0, 0])
                 sample, res_samples = downsample_block(
                     hidden_states=sample,
                     temb=emb,
@@ -1229,7 +1249,7 @@ class UNet2DConditionModel(
                     sample += down_intrablock_additional_residuals.pop(0)
 
             down_block_res_samples += res_samples
-        print("after down sample", sample)
+        # print("after down sample", sample)
         if is_controlnet:
             new_down_block_res_samples = ()
 
@@ -1262,7 +1282,7 @@ class UNet2DConditionModel(
                 and sample.shape == down_intrablock_additional_residuals[0].shape
             ):
                 sample += down_intrablock_additional_residuals.pop(0)
-        print("after mid block", sample)
+        # print("after mid block", sample)
 
         if is_controlnet:
             sample = sample + mid_block_additional_residual
@@ -1297,7 +1317,8 @@ class UNet2DConditionModel(
                     res_hidden_states_tuple=res_samples,
                     upsample_size=upsample_size,
                 )
-        print("after upsample block", sample)
+                
+        # print("after upsample block", sample)
 
         # 6. post-process
         if self.conv_norm_out:

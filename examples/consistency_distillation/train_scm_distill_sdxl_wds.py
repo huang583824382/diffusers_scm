@@ -44,6 +44,7 @@ from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from torch.utils.data import default_collate
 from torchvision import transforms
+from torchvision.utils import save_image
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
 from webdataset.tariterators import (
@@ -58,9 +59,12 @@ from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
     LCMScheduler,
-    StableDiffusionXLPipeline,
-    UNet2DConditionModel,
+    # StableDiffusionXLPipeline,
+    # UNet2DConditionModel,
 )
+from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_scm import StableDiffusionXLPipeline
+from diffusers.models.unets.unet_2d_condition_scm import UNet2DConditionModel
+from diffusers.image_processor import VaeImageProcessor
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import resolve_interpolation_mode
 from diffusers.utils import check_min_version, is_wandb_available
@@ -82,6 +86,65 @@ check_min_version("0.34.0.dev0")
 
 logger = get_logger(__name__)
 
+def vae_decode(vae, latents):
+    # needs_upcasting = vae.dtype == torch.float16 and vae.config.force_upcast
+
+    # if needs_upcasting:
+    #     upcast_vae()
+    #     latents = latents.to(next(iter(vae.post_quant_conv.parameters())).dtype)
+    # elif latents.dtype != vae.dtype:
+    #     if torch.backends.mps.is_available():
+    #         # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
+    #         vae = vae.to(latents.dtype)
+
+    # unscale/denormalize the latents
+    # denormalize with the mean and std if available and not None
+    vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1) if vae is not None else 8
+    print("vae_scale_factor", vae_scale_factor, vae.config.scaling_factor)
+    processor = VaeImageProcessor(vae_scale_factor=vae.config.scaling_factor)
+    has_latents_mean = hasattr(vae.config, "latents_mean") and vae.config.latents_mean is not None
+    has_latents_std = hasattr(vae.config, "latents_std") and vae.config.latents_std is not None
+    if has_latents_mean and has_latents_std:
+        latents_mean = (
+            torch.tensor(vae.config.latents_mean).view(1, 4, 1, 1).to(latents.device, latents.dtype)
+        )
+        latents_std = (
+            torch.tensor(vae.config.latents_std).view(1, 4, 1, 1).to(latents.device, latents.dtype)
+        )
+        latents = latents * latents_std / vae.config.scaling_factor + latents_mean
+    else:
+        latents = latents / vae.config.scaling_factor
+
+    image = vae.decode(latents, return_dict=False)[0]
+    image = processor.postprocess(image, output_type="pt")
+    return image
+
+class MaskGenerator:
+    def __init__(self, max_size, min_size, max_mask_prob, min_mask_prob):
+        self.max_size = max_size
+        self.min_size = min_size
+        self.max_mask_prob = max_mask_prob
+        self.min_mask_prob = min_mask_prob
+        
+    def generate_mask(self, batched_image):
+        # print(batched_image.shape)
+        batch, _, height, width = batched_image.shape
+        
+        masks = []
+        for b in range(batch):
+            rand_size_h = random.randint(self.min_size, self.max_size)
+            rand_size_w = random.randint(self.min_size, self.max_size)
+            # print(rand_size_h, rand_size_w)
+            
+            mask = torch.rand((1, 1, height//rand_size_h, width//rand_size_w), device=batched_image.device)
+            # print(mask.shape)
+            rand_thresh = random.uniform(self.min_mask_prob, self.max_mask_prob)
+            mask = (mask > rand_thresh).float() # 1为高噪声区域，0为低噪声区域
+            mask = F.interpolate(mask, size=(height, width), mode='nearest')
+            masks.append(mask)
+        noise_mask = torch.cat(masks, dim=0).to(dtype=batched_image.dtype, device=batched_image.device) # [batch, 1, height, width]
+        return noise_mask
+            
 
 def filter_keys(key_set):
     def _f(dictionary):
@@ -336,8 +399,12 @@ def scalings_for_boundary_conditions(timestep, sigma_data=0.5, timestep_scaling=
 
 # Compare LCMScheduler.step, Step 4
 def get_predicted_original_sample(model_output, timesteps, sample, prediction_type, alphas, sigmas):
+    print("alphas.shape, timesteps.shape, sigmas.shape", alphas.shape, timesteps.shape, sigmas.shape)
     alphas = extract_into_tensor(alphas, timesteps, sample.shape)
     sigmas = extract_into_tensor(sigmas, timesteps, sample.shape)
+    # print("alphas")
+    # print(alphas)
+    # print(alphas.shape)
     if prediction_type == "epsilon":
         pred_x_0 = (sample - sigmas * model_output) / alphas
     elif prediction_type == "sample":
@@ -372,10 +439,10 @@ def get_predicted_noise(model_output, timesteps, sample, prediction_type, alphas
     return pred_epsilon
 
 
-def extract_into_tensor(a, t, x_shape):
+def extract_into_tensor(a: torch.Tensor, t, x_shape):
     b, *_ = t.shape
-    out = a.gather(-1, t)
-    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+    out = a.gather(0, t)
+    return out.reshape(b, 1, x_shape[-2], x_shape[-1])
 
 
 @torch.no_grad()
@@ -528,7 +595,7 @@ def parse_args():
     parser.add_argument(
         "--report_to",
         type=str,
-        default="tensorboard",
+        default=None,
         help=(
             'The integration to report the results and logs to. Supported platforms are `"tensorboard"`'
             ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
@@ -992,12 +1059,16 @@ def main(args):
 
     # 7. Create online student U-Net. This will be updated by the optimizer (e.g. via backpropagation.)
     # Add `time_cond_proj_dim` to the student U-Net if `teacher_unet.config.time_cond_proj_dim` is None
-    time_cond_proj_dim = (
-        teacher_unet.config.time_cond_proj_dim
-        if teacher_unet.config.time_cond_proj_dim is not None
-        else args.unet_time_cond_proj_dim
-    )
-    unet = UNet2DConditionModel.from_config(teacher_unet.config, time_cond_proj_dim=time_cond_proj_dim)
+    # time_cond_proj_dim = (
+    #     teacher_unet.config.time_cond_proj_dim
+    #     if teacher_unet.config.time_cond_proj_dim is not None
+    #     else args.unet_time_cond_proj_dim
+    # )
+    print("teacher_unet:", teacher_unet.config)
+    print()
+    # unet = UNet2DConditionModel.from_config(teacher_unet.config, time_cond_proj_dim=time_cond_proj_dim)
+    unet = UNet2DConditionModel.from_config(teacher_unet.config)
+    print("unet:", unet.config)
     # load teacher_unet weights into unet
     unet.load_state_dict(teacher_unet.state_dict(), strict=False)
     unet.train()
@@ -1005,7 +1076,7 @@ def main(args):
     # 8. Create target student U-Net. This will be updated via EMA updates (polyak averaging).
     # Initialize from (online) unet
     target_unet = UNet2DConditionModel.from_config(unet.config)
-    target_unet.load_state_dict(unet.state_dict())
+    target_unet.load_state_dict(unet.state_dict(), strict=False)
     target_unet.train()
     target_unet.requires_grad_(False)
 
@@ -1064,7 +1135,7 @@ def main(args):
 
         def load_model_hook(models, input_dir):
             load_model = UNet2DConditionModel.from_pretrained(os.path.join(input_dir, "unet_target"))
-            target_unet.load_state_dict(load_model.state_dict())
+            target_unet.load_state_dict(load_model.state_dict(), strict=False)
             target_unet.to(accelerator.device)
             del load_model
 
@@ -1076,7 +1147,7 @@ def main(args):
                 load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
                 model.register_to_config(**load_model.config)
 
-                model.load_state_dict(load_model.state_dict())
+                model.load_state_dict(load_model.state_dict(), strict=False)
                 del load_model
 
         accelerator.register_save_state_pre_hook(save_model_hook)
@@ -1226,6 +1297,8 @@ def main(args):
     # Create uncond embeds for classifier free guidance
     uncond_prompt_embeds = torch.zeros(args.train_batch_size, 77, 2048).to(accelerator.device)
     uncond_pooled_prompt_embeds = torch.zeros(args.train_batch_size, 1280).to(accelerator.device)
+    
+    mask_generator = MaskGenerator(min_size=4, max_size=64, min_mask_prob=0.4, max_mask_prob=0.8)
 
     # 16. Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -1259,7 +1332,7 @@ def main(args):
             initial_global_step = 0
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
+            accelerator.load_state(os.path.join(args.output_dir, path), strict=False)
             global_step = int(path.split("-")[1])
 
             initial_global_step = global_step
@@ -1274,6 +1347,9 @@ def main(args):
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
+    
+    # log_validation(vae, teacher_unet, args, accelerator, weight_dtype, 0, "teacher")
+    # log_validation(vae, unet, args, accelerator, weight_dtype, 0, "online")
 
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
@@ -1283,6 +1359,7 @@ def main(args):
 
                 image = image.to(accelerator.device, non_blocking=True)
                 encoded_text = compute_embeddings_fn(text, orig_size, crop_coords)
+                # save_image((image + 1) / 2, 'raw_image.png')
 
                 if args.pretrained_vae_model_name_or_path is not None:
                     pixel_values = image.to(dtype=weight_dtype)
@@ -1304,127 +1381,110 @@ def main(args):
 
                 # 2. Sample a random timestep for each image t_n from the ODE solver timesteps without bias.
                 # For the DDIM solver, the timestep schedule is [T - 1, T - k - 1, T - 2 * k - 1, ...]
-                topk = noise_scheduler.config.num_train_timesteps // args.num_ddim_timesteps
-                index = torch.randint(0, args.num_ddim_timesteps, (bsz,), device=latents.device).long()
-                start_timesteps = solver.ddim_timesteps[index]
-                timesteps = start_timesteps - topk
-                timesteps = torch.where(timesteps < 0, torch.zeros_like(timesteps), timesteps)
+                # sample light and heavy timesteps
+                # topk = noise_scheduler.config.num_train_timesteps // args.num_ddim_timesteps
+                # light
+                index_light = torch.randint(0, args.num_ddim_timesteps - 1, (bsz,), device=latents.device).long()
+                timesteps_light = solver.ddim_timesteps[index_light] # 0~48
+                # timesteps_light = solver.ddim_timesteps[49] # 0~49
+                # print("solver.ddim_timesteps", solver.ddim_timesteps) 
+                # [ 19,  39,  59,  79,  99, 119, 139, 159, 179, 199, 219, 239, 259, 279, 299, 319, 339, 359, 379, 399, 419, 439, 459, 479, 499, 519, 539, 559, 579, 599, 619, 639, 659, 679, 699, 719, 739, 759, 779, 799, 819, 839, 859, 879, 899, 919, 939, 959, 979, 999]
+                print("timesteps_light", timesteps_light)
+                # timesteps_light = start_timesteps_light - topk
+                # timesteps_light = torch.where(timesteps_light < 0, torch.zeros_like(timesteps_light), timesteps_light)
+                
+                # heavy
+                r = torch.rand((bsz,), device=latents.device)
+                # index_heavy = (index_light + 1 + (args.num_ddim_timesteps - index_light - 1) * r).long()
+                index_heavy = (index_light + 1 + (args.num_ddim_timesteps - index_light - 1) * r).long()
+                timesteps_heavy = solver.ddim_timesteps[index_heavy] # index_light+1 ~ 49
+                print("timesteps_heavy", timesteps_heavy)
 
                 # 3. Get boundary scalings for start_timesteps and (end) timesteps.
-                c_skip_start, c_out_start = scalings_for_boundary_conditions(
-                    start_timesteps, timestep_scaling=args.timestep_scaling_factor
+                
+                c_skip_light, c_out_light = scalings_for_boundary_conditions(
+                    timesteps_light, timestep_scaling=args.timestep_scaling_factor
                 )
-                c_skip_start, c_out_start = [append_dims(x, latents.ndim) for x in [c_skip_start, c_out_start]]
-                c_skip, c_out = scalings_for_boundary_conditions(
-                    timesteps, timestep_scaling=args.timestep_scaling_factor
-                )
-                c_skip, c_out = [append_dims(x, latents.ndim) for x in [c_skip, c_out]]
+                c_skip_light, c_out_light = [append_dims(x, latents.ndim) for x in [c_skip_light, c_out_light]]
 
                 # 4. Sample noise from the prior and add it to the latents according to the noise magnitude at each
                 # timestep (this is the forward diffusion process) [z_{t_{n + k}} in Algorithm 1]
+                # SCM data
+                noise_masks = mask_generator.generate_mask(latents) # true for high noise
                 noise = torch.randn_like(latents)
-                noisy_model_input = noise_scheduler.add_noise(latents, noise, start_timesteps)
+                noisy_model_input_light = noise_scheduler.add_noise(latents, noise, timesteps_light)
+                noisy_model_input_heavy = noise_scheduler.add_noise(latents, noise, timesteps_heavy)
+                
+                noisy_model_input = noise_masks * noisy_model_input_heavy + (1 - noise_masks) * noisy_model_input_light
+                
+                # save_image(noise_masks, 'mask.png')
+                
+                # print(noisy_model_input.dtype)
+                # noisy_model_input = noisy_model_input.to(weight_dtype)
+                # images = vae_decode(vae, noisy_model_input)
+                # print(images.min(), images.max())
+                # print('saving image')
+                # save_image(images, 'noisy_model_input.png')
+                
+                # return
 
                 # 5. Sample a random guidance scale w from U[w_min, w_max] and embed it
-                w = (args.w_max - args.w_min) * torch.rand((bsz,)) + args.w_min
-                w_embedding = guidance_scale_embedding(w, embedding_dim=time_cond_proj_dim)
-                w = w.reshape(bsz, 1, 1, 1)
-                # Move to U-Net device and dtype
-                w = w.to(device=latents.device, dtype=latents.dtype)
-                w_embedding = w_embedding.to(device=latents.device, dtype=latents.dtype)
-
+                # w = (args.w_max - args.w_min) * torch.rand((bsz,)) + args.w_min
+                # w_embedding = guidance_scale_embedding(w, embedding_dim=time_cond_proj_dim)
+                # w = w.reshape(bsz, 1, 1, 1)
+                # # Move to U-Net device and dtype
+                # w = w.to(device=latents.device, dtype=latents.dtype)
+                # w_embedding = w_embedding.to(device=latents.device, dtype=latents.dtype) # [B, 256]
                 # 6. Prepare prompt embeds and unet_added_conditions
-                prompt_embeds = encoded_text.pop("prompt_embeds")
-
+                prompt_embeds = encoded_text.pop("prompt_embeds") # [B, 77, 2048]
                 # 7. Get online LCM prediction on z_{t_{n + k}} (noisy_model_input), w, c, t_{n + k} (start_timesteps)
+                
+                uncond_prob = 0.05
+                if random.random() < uncond_prob:
+                    print("using uncond...")
+                    prompt_embeds = uncond_prompt_embeds
+                    encoded_text["text_embeds"] = uncond_pooled_prompt_embeds
+                
+                
+                
+                timesteps = noise_masks * timesteps_heavy[..., None, None, None] + (1 - noise_masks) * timesteps_light[..., None, None, None]
+                
+                timesteps_light = timesteps_light[..., None, None, None].expand(-1, -1, timesteps.shape[-2], timesteps.shape[-1])
+                
+                c_skip_noise, c_out_noise = scalings_for_boundary_conditions(
+                    timesteps, timestep_scaling=args.timestep_scaling_factor
+                )
+                c_skip_noise, c_out_noise = [append_dims(x, latents.ndim) for x in [c_skip_noise, c_out_noise]]
+                
+                print("time_steps.shape", timesteps.shape)
                 noise_pred = unet(
                     noisy_model_input,
-                    start_timesteps,
-                    timestep_cond=w_embedding,
+                    timesteps,
                     encoder_hidden_states=prompt_embeds.float(),
                     added_cond_kwargs=encoded_text,
                 ).sample
+                # print(noise_pred.shape)
+                
+                # images = vae_decode(vae, noisy_model_input)
+                # save_image(images, 'noisy_model_input.png')
+                # save_image(timesteps / 1000.0, 'timesteps.png')
+                
+                # return 
+                
+                # print(alpha_schedule.shape)
+                # print(alpha_schedule[..., None, None, None].shape)
+                # print(alpha_schedule[..., None, None, None].expand(-1, -1, timesteps.shape[-2], timesteps.shape[-1]).shape)
 
                 pred_x_0 = get_predicted_original_sample(
                     noise_pred,
-                    start_timesteps,
+                    timesteps.long(),
                     noisy_model_input,
                     noise_scheduler.config.prediction_type,
-                    alpha_schedule,
-                    sigma_schedule,
+                    alpha_schedule[..., None, None, None].expand(-1, -1, timesteps.shape[-2], timesteps.shape[-1]),
+                    sigma_schedule[..., None, None, None].expand(-1, -1, timesteps.shape[-2], timesteps.shape[-1]),
                 )
 
-                model_pred = c_skip_start * noisy_model_input + c_out_start * pred_x_0
-
-                # 8. Compute the conditional and unconditional teacher model predictions to get CFG estimates of the
-                # predicted noise eps_0 and predicted original sample x_0, then run the ODE solver using these
-                # estimates to predict the data point in the augmented PF-ODE trajectory corresponding to the next ODE
-                # solver timestep.
-                with torch.no_grad():
-                    if torch.backends.mps.is_available():
-                        autocast_ctx = nullcontext()
-                    else:
-                        autocast_ctx = torch.autocast(accelerator.device.type)
-
-                    with autocast_ctx:
-                        # 1. Get teacher model prediction on noisy_model_input z_{t_{n + k}} and conditional embedding c
-                        cond_teacher_output = teacher_unet(
-                            noisy_model_input.to(weight_dtype),
-                            start_timesteps,
-                            encoder_hidden_states=prompt_embeds.to(weight_dtype),
-                            added_cond_kwargs={k: v.to(weight_dtype) for k, v in encoded_text.items()},
-                        ).sample
-                        cond_pred_x0 = get_predicted_original_sample(
-                            cond_teacher_output,
-                            start_timesteps,
-                            noisy_model_input,
-                            noise_scheduler.config.prediction_type,
-                            alpha_schedule,
-                            sigma_schedule,
-                        )
-                        cond_pred_noise = get_predicted_noise(
-                            cond_teacher_output,
-                            start_timesteps,
-                            noisy_model_input,
-                            noise_scheduler.config.prediction_type,
-                            alpha_schedule,
-                            sigma_schedule,
-                        )
-
-                        # 2. Get teacher model prediction on noisy_model_input z_{t_{n + k}} and unconditional embedding 0
-                        uncond_added_conditions = copy.deepcopy(encoded_text)
-                        uncond_added_conditions["text_embeds"] = uncond_pooled_prompt_embeds
-                        uncond_teacher_output = teacher_unet(
-                            noisy_model_input.to(weight_dtype),
-                            start_timesteps,
-                            encoder_hidden_states=uncond_prompt_embeds.to(weight_dtype),
-                            added_cond_kwargs={k: v.to(weight_dtype) for k, v in uncond_added_conditions.items()},
-                        ).sample
-                        uncond_pred_x0 = get_predicted_original_sample(
-                            uncond_teacher_output,
-                            start_timesteps,
-                            noisy_model_input,
-                            noise_scheduler.config.prediction_type,
-                            alpha_schedule,
-                            sigma_schedule,
-                        )
-                        uncond_pred_noise = get_predicted_noise(
-                            uncond_teacher_output,
-                            start_timesteps,
-                            noisy_model_input,
-                            noise_scheduler.config.prediction_type,
-                            alpha_schedule,
-                            sigma_schedule,
-                        )
-
-                        # 3. Calculate the CFG estimate of x_0 (pred_x0) and eps_0 (pred_noise)
-                        # Note that this uses the LCM paper's CFG formulation rather than the Imagen CFG formulation
-                        pred_x0 = cond_pred_x0 + w * (cond_pred_x0 - uncond_pred_x0)
-                        pred_noise = cond_pred_noise + w * (cond_pred_noise - uncond_pred_noise)
-                        # 4. Run one step of the ODE solver to estimate the next point x_prev on the
-                        # augmented PF-ODE trajectory (solving backward in time)
-                        # Note that the DDIM step depends on both the predicted x_0 and source noise eps_0.
-                        x_prev = solver.ddim_step(pred_x0, pred_noise, index)
+                model_pred = c_skip_noise * noisy_model_input + c_out_noise * pred_x_0
 
                 # 9. Get target LCM prediction on x_prev, w, c, t_n (timesteps)
                 with torch.no_grad():
@@ -1434,22 +1494,25 @@ def main(args):
                         autocast_ctx = torch.autocast(accelerator.device.type, dtype=weight_dtype)
 
                     with autocast_ctx:
-                        target_noise_pred = target_unet(
-                            x_prev.float(),
-                            timesteps,
-                            timestep_cond=w_embedding,
+                        target_noise_pred = teacher_unet(
+                            noisy_model_input_light,
+                            timesteps_light,
                             encoder_hidden_states=prompt_embeds.float(),
                             added_cond_kwargs=encoded_text,
                         ).sample
+                    # images = vae_decode(vae, noisy_model_input_light)
+                    # save_image(images, 'noisy_model_input_light.png')
+                    # save_image(timesteps_light / 1000.0, 'timesteps_light.png')
+                    # return
                     pred_x_0 = get_predicted_original_sample(
                         target_noise_pred,
-                        timesteps,
-                        x_prev,
+                        timesteps_light.long(),
+                        noisy_model_input_light,
                         noise_scheduler.config.prediction_type,
-                        alpha_schedule,
-                        sigma_schedule,
+                        alpha_schedule[..., None, None, None].expand(-1, -1, timesteps_light.shape[-2], timesteps_light.shape[-1]),
+                        sigma_schedule[..., None, None, None].expand(-1, -1, timesteps_light.shape[-2], timesteps_light.shape[-1]),
                     )
-                    target = c_skip * x_prev + c_out * pred_x_0
+                    target = c_skip_light * noisy_model_input_light + c_out_light * pred_x_0
 
                 # 10. Calculate loss
                 if args.loss_type == "l2":
@@ -1501,7 +1564,7 @@ def main(args):
                         logger.info(f"Saved state to {save_path}")
 
                     if global_step % args.validation_steps == 0:
-                        log_validation(vae, target_unet, args, accelerator, weight_dtype, global_step, "target")
+                        log_validation(vae, teacher_unet, args, accelerator, weight_dtype, global_step, "teacher")
                         log_validation(vae, unet, args, accelerator, weight_dtype, global_step, "online")
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}

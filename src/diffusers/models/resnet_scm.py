@@ -19,6 +19,7 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 
 from ..utils import deprecate
 from .activations import get_activation
@@ -345,8 +346,15 @@ class ResnetBlock2D(nn.Module):
                 temb = self.nonlinearity(temb)
             # TODO 实现interpolate
             # temb [B, C]
-            temb = self.time_emb_proj(temb)[:, :, None, None]
+            b, c, h, w = temb.shape
+            temb = rearrange(temb, "b c h w -> b h w c")
+            temb = self.time_emb_proj(temb)
+            temb = rearrange(temb, "b h w c -> b c h w")
             # temb [B, C, 1, 1]
+        
+        temb = F.interpolate(
+            temb, size=hidden_states.shape[2:], mode="bilinear", align_corners=False)
+        
         # if temb is not None:
         #     print("in resnet block temb:", temb[0, :, 0, 0])
         #     print("temb.shape:", temb.shape)

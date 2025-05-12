@@ -1213,12 +1213,17 @@ class StableDiffusionXLPipeline(
                 added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
                 if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
                     added_cond_kwargs["image_embeds"] = image_embeds
-                print("t:", t)
+                    
+                t_m = torch.ones((latent_model_input.shape[0], 1, latent_model_input.shape[2], latent_model_input.shape[3]), device=device) * t
+                # print("timestep_cond.shape", timestep_cond.shape)
+                print("t:", t_m.shape)
+                print(added_cond_kwargs) # only text_embeds
+                
                 noise_pred = self.unet(
                     latent_model_input,
-                    t,
+                    t_m,
                     encoder_hidden_states=prompt_embeds,
-                    timestep_cond=timestep_cond,
+                    timestep_cond=timestep_cond, # None
                     cross_attention_kwargs=self.cross_attention_kwargs,
                     added_cond_kwargs=added_cond_kwargs,
                     return_dict=False,
@@ -1227,8 +1232,8 @@ class StableDiffusionXLPipeline(
                 # perform guidance
                 if self.do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    # print(noise_pred_uncond)
-                    # print(noise_pred_text)
+                    print("noise_pred_uncond", noise_pred_uncond.mean())
+                    print("noise_pred_text", noise_pred_text.mean())
                     
                     noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
 
