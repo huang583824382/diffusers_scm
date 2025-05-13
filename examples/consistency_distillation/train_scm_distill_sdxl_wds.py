@@ -30,6 +30,7 @@ from typing import List, Union
 
 import accelerate
 import numpy as np
+from PIL import Image
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -86,7 +87,7 @@ check_min_version("0.34.0.dev0")
 
 logger = get_logger(__name__)
 
-def vae_decode(vae, latents):
+def vae_decode(vae, latents, output_type='pt'):
     # needs_upcasting = vae.dtype == torch.float16 and vae.config.force_upcast
 
     # if needs_upcasting:
@@ -116,7 +117,7 @@ def vae_decode(vae, latents):
         latents = latents / vae.config.scaling_factor
 
     image = vae.decode(latents, return_dict=False)[0]
-    image = processor.postprocess(image, output_type="pt")
+    image = processor.postprocess(image, output_type=output_type)
     return image
 
 class MaskGenerator:
@@ -142,7 +143,7 @@ class MaskGenerator:
             mask = (mask > rand_thresh).float() # 1为高噪声区域，0为低噪声区域
             mask = F.interpolate(mask, size=(height, width), mode='nearest')
             masks.append(mask)
-        noise_mask = torch.cat(masks, dim=0).to(dtype=batched_image.dtype, device=batched_image.device) # [batch, 1, height, width]
+        noise_mask = torch.cat(masks, dim=0).to(device=batched_image.device) # [batch, 1, height, width]
         return noise_mask
             
 
@@ -162,6 +163,8 @@ def group_by_keys_nothrow(data, keys=base_plus_ext, lcase=True, suffixes=None, h
     current_sample = None
     for filesample in data:
         assert isinstance(filesample, dict)
+        if "fname" not in filesample or "data" not in filesample:
+            continue
         fname, value = filesample["fname"], filesample["data"]
         prefix, suffix = keys(fname)
         if prefix is None:
@@ -304,6 +307,11 @@ def log_validation(vae, unet, args, accelerator, weight_dtype, step, name="targe
     logger.info("Running validation... ")
 
     unet = accelerator.unwrap_model(unet)
+    unet_dtype = unet.dtype
+    # print("weight_type", weight_dtype)
+    # print("unet", unet.dtype)
+    if unet_dtype != weight_dtype:
+        unet = unet.to(weight_dtype)
     pipeline = StableDiffusionXLPipeline.from_pretrained(
         args.pretrained_teacher_model,
         vae=vae,
@@ -312,6 +320,9 @@ def log_validation(vae, unet, args, accelerator, weight_dtype, step, name="targe
         revision=args.revision,
         torch_dtype=weight_dtype,
     )
+    # noise_scheduler = DDPMScheduler.from_pretrained(
+    #     args.pretrained_teacher_model, subfolder="scheduler"
+    # )
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
 
@@ -321,53 +332,72 @@ def log_validation(vae, unet, args, accelerator, weight_dtype, step, name="targe
     if args.seed is None:
         generator = None
     else:
-        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+        generator = torch.manual_seed(0)
 
-    validation_prompts = [
-        "portrait photo of a girl, photograph, highly detailed face, depth of field, moody light, golden hour, style by Dan Winters, Russell James, Steve McCurry, centered, extremely detailed, Nikon D850, award winning photography",
-        "Self-portrait oil painting, a beautiful cyborg with golden hair, 8k",
-        "Astronaut in a jungle, cold color palette, muted colors, detailed, 8k",
-        "A photo of beautiful mountain with realistic sunset and blue lake, highly detailed, masterpiece",
-    ]
-
+    validation_prompt = "a photo of an astronaut riding a horse on Mars, digital art"
+    
+    # get latent
+    image = Image.open("/mnt/afs_james/zhiwei/diffusers_scm/examples/consistency_distillation/astronaut_rides_horse.png").convert("RGB")
+    image = TF.to_tensor(image)
+    pixel_values = TF.normalize(image, [0.5], [0.5]).to("cuda", pipeline.vae.dtype)
+    latents = pipeline.vae.encode(pixel_values[None]).latent_dist.sample()
+    latents = latents * pipeline.vae.config.scaling_factor
+    
+    # add mask
+    mask_generator = MaskGenerator(min_size=8, max_size=8, min_mask_prob=0.7, max_mask_prob=0.9)
+    noise_masks = mask_generator.generate_mask(latents)
+    noise = torch.randn(latents.shape, generator=generator).to("cuda")
+    
     image_logs = []
+    
+    noises = [(0, 999), (100, 999), (200, 999), (300, 999), (400, 999), (300, 700), (300, 800), (300, 900)]
 
-    for _, prompt in enumerate(validation_prompts):
-        images = []
-        if torch.backends.mps.is_available():
-            autocast_ctx = nullcontext()
-        else:
-            autocast_ctx = torch.autocast(accelerator.device.type)
-
-        with autocast_ctx:
-            images = pipeline(
-                prompt=prompt,
-                num_inference_steps=4,
-                num_images_per_prompt=4,
-                generator=generator,
-            ).images
-        image_logs.append({"validation_prompt": prompt, "images": images})
+    for _, noise_weight in enumerate(noises):
+        timesteps_light = torch.ones((latents.shape[0],), device=latents.device, dtype=torch.long) * noise_weight[0]
+        timesteps_heavy = torch.ones((latents.shape[0],), device=latents.device, dtype=torch.long) * noise_weight[1]
+        
+        noisy_model_input_light = pipeline.scheduler.add_noise(latents, noise, timesteps_light)
+        noisy_model_input_heavy = pipeline.scheduler.add_noise(latents, noise, timesteps_heavy)
+        
+        # generate model input
+        noisy_model_input = noise_masks * noisy_model_input_heavy + (1 - noise_masks) * noisy_model_input_light
+        
+        # generate timesteps
+        timesteps = noise_masks * timesteps_heavy[..., None, None, None] + (1 - noise_masks) * timesteps_light[..., None, None, None]
+        timesteps = timesteps.to("cuda", weight_dtype)
+        # inference
+        noisy_model_input = noisy_model_input.to("cuda", weight_dtype)
+        # print(noisy_model_input.dtype)
+        # print(timesteps.dtype)
+        # print(pipeline.dtype)
+        
+        inpainted_latents = pipeline.predict_scm(validation_prompt, masked_latents=noisy_model_input, timesteps=timesteps)
+        # print(inpainted_latents.dtype)
+        inpainted_latents = inpainted_latents.to(pipeline.vae.dtype)
+        images = vae_decode(pipeline.vae, inpainted_latents, output_type='pil')
+        
+        image_logs.append({"noise_weight": noise_weight, "images": images})
 
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
             for log in image_logs:
                 images = log["images"]
-                validation_prompt = log["validation_prompt"]
+                noise_weight = log["noise_weight"]
                 formatted_images = []
                 for image in images:
                     formatted_images.append(np.asarray(image))
 
                 formatted_images = np.stack(formatted_images)
 
-                tracker.writer.add_images(validation_prompt, formatted_images, step, dataformats="NHWC")
+                tracker.writer.add_images(f"{noise_weight}", formatted_images, step, dataformats="NHWC")
         elif tracker.name == "wandb":
             formatted_images = []
 
             for log in image_logs:
                 images = log["images"]
-                validation_prompt = log["validation_prompt"]
+                noise_weight = log["noise_weight"]
                 for image in images:
-                    image = wandb.Image(image, caption=validation_prompt)
+                    image = wandb.Image(image, caption=f"{noise_weight}")
                     formatted_images.append(image)
 
             tracker.log({f"validation/{name}": formatted_images})
@@ -377,7 +407,6 @@ def log_validation(vae, unet, args, accelerator, weight_dtype, step, name="targe
         del pipeline
         gc.collect()
         torch.cuda.empty_cache()
-
         return image_logs
 
 
@@ -1348,8 +1377,8 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
     
-    # log_validation(vae, teacher_unet, args, accelerator, weight_dtype, 0, "teacher")
-    # log_validation(vae, unet, args, accelerator, weight_dtype, 0, "online")
+    # log_validation(vae, teacher_unet, args, accelerator, torch.float32, 0, "teacher")
+    # log_validation(vae, unet, args, accelerator, torch.float32, 0, "online")
 
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
@@ -1386,6 +1415,7 @@ def main(args):
                 # light
                 index_light = torch.randint(0, args.num_ddim_timesteps - 1, (bsz,), device=latents.device).long()
                 timesteps_light = solver.ddim_timesteps[index_light] # 0~48
+                timesteps_light_raw = timesteps_light.clone()
                 # timesteps_light = solver.ddim_timesteps[49] # 0~49
                 # print("solver.ddim_timesteps", solver.ddim_timesteps) 
                 # [ 19,  39,  59,  79,  99, 119, 139, 159, 179, 199, 219, 239, 259, 279, 299, 319, 339, 359, 379, 399, 419, 439, 459, 479, 499, 519, 539, 559, 579, 599, 619, 639, 659, 679, 699, 719, 739, 759, 779, 799, 819, 839, 859, 879, 899, 919, 939, 959, 979, 999]
@@ -1400,17 +1430,11 @@ def main(args):
                 timesteps_heavy = solver.ddim_timesteps[index_heavy] # index_light+1 ~ 49
                 print("timesteps_heavy", timesteps_heavy)
 
-                # 3. Get boundary scalings for start_timesteps and (end) timesteps.
-                
-                c_skip_light, c_out_light = scalings_for_boundary_conditions(
-                    timesteps_light, timestep_scaling=args.timestep_scaling_factor
-                )
-                c_skip_light, c_out_light = [append_dims(x, latents.ndim) for x in [c_skip_light, c_out_light]]
 
                 # 4. Sample noise from the prior and add it to the latents according to the noise magnitude at each
                 # timestep (this is the forward diffusion process) [z_{t_{n + k}} in Algorithm 1]
                 # SCM data
-                noise_masks = mask_generator.generate_mask(latents) # true for high noise
+                noise_masks = mask_generator.generate_mask(latents).float() # true for high noise
                 noise = torch.randn_like(latents)
                 noisy_model_input_light = noise_scheduler.add_noise(latents, noise, timesteps_light)
                 noisy_model_input_heavy = noise_scheduler.add_noise(latents, noise, timesteps_heavy)
@@ -1439,11 +1463,11 @@ def main(args):
                 prompt_embeds = encoded_text.pop("prompt_embeds") # [B, 77, 2048]
                 # 7. Get online LCM prediction on z_{t_{n + k}} (noisy_model_input), w, c, t_{n + k} (start_timesteps)
                 
-                uncond_prob = 0.05
-                if random.random() < uncond_prob:
-                    print("using uncond...")
-                    prompt_embeds = uncond_prompt_embeds
-                    encoded_text["text_embeds"] = uncond_pooled_prompt_embeds
+                # uncond_prob = 0.05
+                # if random.random() < uncond_prob:
+                #     print("using uncond...")
+                #     prompt_embeds = uncond_prompt_embeds
+                #     encoded_text["text_embeds"] = uncond_pooled_prompt_embeds
                 
                 
                 
@@ -1451,10 +1475,49 @@ def main(args):
                 
                 timesteps_light = timesteps_light[..., None, None, None].expand(-1, -1, timesteps.shape[-2], timesteps.shape[-1])
                 
+                # 3. Get boundary scalings for start_timesteps and (end) timesteps.
+                
+                c_skip_light, c_out_light = scalings_for_boundary_conditions(
+                    timesteps_light, timestep_scaling=args.timestep_scaling_factor
+                )
+                # c_skip_light, c_out_light = [append_dims(x, latents.ndim) for x in [c_skip_light, c_out_light]]
+                
+                # save_image(c_skip_light, 'c_skip_light.png')
+                # save_image(c_out_light, 'c_out_light.png')
+                
+                
                 c_skip_noise, c_out_noise = scalings_for_boundary_conditions(
                     timesteps, timestep_scaling=args.timestep_scaling_factor
                 )
-                c_skip_noise, c_out_noise = [append_dims(x, latents.ndim) for x in [c_skip_noise, c_out_noise]]
+                # c_skip_noise, c_out_noise = [append_dims(x, latents.ndim) for x in [c_skip_noise, c_out_noise]]
+                
+                # save_image(c_skip_noise, 'c_skip_noise.png')
+                # save_image(c_out_noise, 'c_out_noise.png')
+                
+                # c_skip_heavy_gt, c_out_heavy_gt = scalings_for_boundary_conditions(
+                #     timesteps_heavy, timestep_scaling=args.timestep_scaling_factor
+                # )
+                # c_skip_heavy_gt, c_out_heavy_gt = [append_dims(x, latents.ndim) for x in [c_skip_heavy_gt, c_out_heavy_gt]]
+                
+                # c_skip_light_gt, c_out_light_gt = scalings_for_boundary_conditions(
+                #     timesteps_light_raw, timestep_scaling=args.timestep_scaling_factor
+                # )
+                # c_skip_light_gt, c_out_light_gt = [append_dims(x, latents.ndim) for x in [c_skip_light_gt, c_out_light_gt]]
+                
+                # torch.save({
+                #     "c_skip_light": c_skip_light,
+                #     "c_out_light": c_out_light,
+                #     "c_skip_noise": c_skip_noise,
+                #     "c_out_noise": c_out_noise,
+                #     "c_skip_heavy_gt": c_skip_heavy_gt,
+                #     "c_out_heavy_gt": c_out_heavy_gt,
+                #     "c_skip_light_gt": c_skip_light_gt,
+                #     "c_out_light_gt": c_out_light_gt,
+                #     "timesteps": timesteps,
+                #     "timesteps_light": timesteps_light,
+                # }, 'c_shape.pt')
+                
+                # return
                 
                 print("time_steps.shape", timesteps.shape)
                 noise_pred = unet(
@@ -1564,8 +1627,9 @@ def main(args):
                         logger.info(f"Saved state to {save_path}")
 
                     if global_step % args.validation_steps == 0:
-                        log_validation(vae, teacher_unet, args, accelerator, weight_dtype, global_step, "teacher")
-                        log_validation(vae, unet, args, accelerator, weight_dtype, global_step, "online")
+                        log_validation(vae, teacher_unet, args, accelerator, torch.float32, global_step, "teacher")
+                        log_validation(vae, unet, args, accelerator, torch.float32, global_step, "online")
+                        log_validation(vae, target_unet, args, accelerator, torch.float32, global_step, "ema_target")
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
